@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Interactive WireGuard setup: output matches labno_02 (server_labno_02.sh + router.sh + pc.sh).
+#
+# Standalone WireGuard setup (labno_02-style configs). Safe to copy anywhere;
+# does not source or require any other file from this repository.
+#
 set -euo pipefail
 umask 077
-
-BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "======================================"
 echo " VPNCN2 WireGuard Setup (labno_02)"
@@ -290,22 +291,163 @@ WG_TABLE="${WG_TABLE:-}"
 ROUTER_ALLOWED_IPS="${ROUTER_ALLOWED_IPS:-}"
 
 ########################################
-# EXPORT + same modules as up_labno_02.sh
+# Write configs (inlined labno_02 layout — no external scripts)
 ########################################
-export WG_IF WG_DIR OUT_DIR
-export WG_PRIV WG_PUB
-export ROUTER_NAME
-export SERVER_NAME SERVER_PUBLIC_IP WG_LISTENPORT
-export WG_SERVER_ADDR ROUTER_ADDR PC_ADDR PC_IP_ONLY WAN_IF
-export DNS_LIST ALLOWED_ALL KEEPALIVE
-export WG_TABLE WG_RP_FILTER WG_USE_MARK_ROUTING WG_POLICY_TABLE ROUTER_ALLOWED_IPS
+ROUTER_IP_32="${ROUTER_ADDR%/*}"
+SERVER_IP="${WG_SERVER_ADDR%/*}"
+SUBNET="${SERVER_IP%.*}.0/24"
+POLICY_TABLE="${WG_POLICY_TABLE:-51820}"
 
-# shellcheck source=server_labno_02.sh
-source "${BASE_DIR}/server_labno_02.sh"
-# shellcheck source=router.sh
-source "${BASE_DIR}/router.sh"
-# shellcheck source=pc.sh
-source "${BASE_DIR}/pc.sh"
+if [[ "${WG_USE_MARK_ROUTING}" == "1" ]]; then
+  TABLE_VAL="off"
+else
+  TABLE_VAL="${WG_TABLE:-${WG_LISTENPORT}}"
+fi
+
+WG_CONF="${WG_DIR}/${WG_IF}.conf"
+
+{
+  echo "[Interface]"
+  echo "Address = ${WG_SERVER_ADDR}"
+  echo "PrivateKey = $(cat "$WG_PRIV")"
+  echo "ListenPort = ${WG_LISTENPORT}"
+  echo "Table = ${TABLE_VAL}"
+  echo ""
+
+  if [[ "${WG_USE_MARK_ROUTING}" == "1" ]]; then
+    echo "# ========= SYSCTL ========="
+    echo "PostUp   = sysctl -w net.ipv4.ip_forward=1"
+
+    if [[ "${WG_RP_FILTER}" == "0" ]]; then
+      echo "PostUp   = sysctl -w net.ipv4.conf.all.rp_filter=0"
+      echo "PostUp   = sysctl -w net.ipv4.conf.default.rp_filter=0"
+      echo "PostUp   = sysctl -w net.ipv4.conf.${WG_IF}.rp_filter=0"
+      echo "PostUp   = sysctl -w net.ipv4.conf.${WAN_IF}.rp_filter=0"
+    fi
+
+    echo ""
+    echo "# ========= FORWARD (insert at top to bypass Docker etc) ========="
+    echo "PostUp   = iptables -I FORWARD 1 -i ${WG_IF} -o ${WG_IF} -j ACCEPT"
+    echo "PostUp   = iptables -I FORWARD 1 -i ${WG_IF} -o ${WAN_IF} -j ACCEPT"
+    echo "PostUp   = iptables -I FORWARD 1 -m state --state RELATED,ESTABLISHED -j ACCEPT"
+    echo "PostDown = iptables -D FORWARD -i ${WG_IF} -o ${WG_IF} -j ACCEPT 2>/dev/null || true"
+    echo "PostDown = iptables -D FORWARD -i ${WG_IF} -o ${WAN_IF} -j ACCEPT 2>/dev/null || true"
+    echo "PostDown = iptables -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
+
+    echo ""
+    echo "# ========= MARK PC TRAFFIC (exempt intra-WG first) ========="
+    echo "PostUp   = iptables -t mangle -A PREROUTING -i ${WG_IF} -s ${PC_IP_ONLY} -d ${SUBNET} -j ACCEPT"
+    echo "PostUp   = iptables -t mangle -A PREROUTING -i ${WG_IF} -s ${PC_IP_ONLY} -j MARK --set-mark 11"
+    echo "PostDown = iptables -t mangle -D PREROUTING -i ${WG_IF} -s ${PC_IP_ONLY} -d ${SUBNET} -j ACCEPT 2>/dev/null || true"
+    echo "PostDown = iptables -t mangle -D PREROUTING -i ${WG_IF} -s ${PC_IP_ONLY} -j MARK --set-mark 11 2>/dev/null || true"
+
+    echo ""
+    echo "# ========= POLICY ROUTING: PC -> Router ========="
+    echo "PostUp   = ip rule del fwmark 11 lookup ${POLICY_TABLE} priority 100 2>/dev/null || true"
+    echo "PostUp   = ip rule add fwmark 11 lookup ${POLICY_TABLE} priority 100"
+    echo "PostDown = ip rule del fwmark 11 lookup ${POLICY_TABLE} priority 100 2>/dev/null || true"
+
+    echo ""
+    echo "PostUp   = ip route add ${SUBNET} dev ${WG_IF} table ${POLICY_TABLE} 2>/dev/null || ip route replace ${SUBNET} dev ${WG_IF} table ${POLICY_TABLE}"
+    echo "PostUp   = ip route add default via ${ROUTER_IP_32} dev ${WG_IF} table ${POLICY_TABLE} 2>/dev/null || ip route replace default via ${ROUTER_IP_32} dev ${WG_IF} table ${POLICY_TABLE}"
+    echo "PostDown = ip route del default via ${ROUTER_IP_32} dev ${WG_IF} table ${POLICY_TABLE} 2>/dev/null || true"
+    echo "PostDown = ip route del ${SUBNET} dev ${WG_IF} table ${POLICY_TABLE} 2>/dev/null || true"
+
+    echo ""
+    echo "# ========= NAT: masquerade WG traffic -> WAN ========="
+    echo "PostUp   = iptables -t nat -A POSTROUTING -s ${SUBNET} -o ${WAN_IF} -j MASQUERADE"
+    echo "PostDown = iptables -t nat -D POSTROUTING -s ${SUBNET} -o ${WAN_IF} -j MASQUERADE 2>/dev/null || true"
+  else
+    echo "# Note: sysctl net.ipv4.ip_forward should be set at host/Docker level"
+    echo "PostUp = iptables -A FORWARD -i ${WG_IF} -o ${WG_IF} -j ACCEPT"
+    echo "PostUp = iptables -I FORWARD -i ${WAN_IF} -o ${WG_IF} -j ACCEPT"
+    echo "PostUp = iptables -t nat -A POSTROUTING -o ${WAN_IF} -j MASQUERADE"
+    echo "PostUp = ip rule del from ${PC_IP_ONLY} lookup ${TABLE_VAL} priority 100 2>/dev/null || true"
+    echo "PostUp = ip rule add from ${PC_IP_ONLY} lookup ${TABLE_VAL} priority 100"
+    echo ""
+    echo "PostDown = iptables -D FORWARD -i ${WG_IF} -o ${WG_IF} -j ACCEPT"
+    echo "PostDown = ip rule del from ${PC_IP_ONLY} lookup ${TABLE_VAL} priority 100"
+    echo "PostDown = iptables -D FORWARD -i ${WAN_IF} -o ${WG_IF} -j ACCEPT"
+    echo "PostDown = iptables -t nat -D POSTROUTING -o ${WAN_IF} -j MASQUERADE"
+  fi
+
+  echo ""
+  echo "# ------ ROUTER (exit node for PC) ------"
+  echo "[Peer]"
+  echo "PublicKey = $(cat "${OUT_DIR}/router_publickey")"
+  echo "PresharedKey = $(cat "${OUT_DIR}/router_psk")"
+  echo "AllowedIPs = ${ROUTER_IP_32}/32, 0.0.0.0/0"
+  echo "PersistentKeepalive = ${KEEPALIVE}"
+
+  echo ""
+  echo "# ------ PC ------"
+  echo "[Peer]"
+  echo "PublicKey = $(cat "${OUT_DIR}/pc_publickey")"
+  echo "PresharedKey = $(cat "${OUT_DIR}/pc_psk")"
+  echo "AllowedIPs = ${PC_IP_ONLY}/32"
+  echo "PersistentKeepalive = ${KEEPALIVE}"
+} >"$WG_CONF"
+
+chmod 600 "$WG_CONF"
+
+ROUTER_CONF="${OUT_DIR}/router.conf"
+ROUTER_ALLOWED="${ROUTER_ALLOWED_IPS:-subnet}"
+if [[ "$ROUTER_ALLOWED" == "subnet" ]]; then
+  ROUTER_SUBNET_IP="${ROUTER_ADDR%/*}"
+  ROUTER_ALLOWED_IPS_VAL="${ROUTER_SUBNET_IP%.*}.0/24"
+elif [[ "$ROUTER_ALLOWED" == "all" || -z "$ROUTER_ALLOWED" ]]; then
+  ROUTER_ALLOWED_IPS_VAL="0.0.0.0/0, ::/0"
+else
+  ROUTER_ALLOWED_IPS_VAL="${ROUTER_ALLOWED}"
+fi
+if [[ "${WG_ROUTER_ALLOWED_IPS_V4_ONLY:-0}" == "1" ]]; then
+  ROUTER_ALLOWED_IPS_VAL="0.0.0.0/0"
+fi
+
+{
+  echo "#==============================================================================="
+  echo "# ${ROUTER_NAME}.conf PEER to ${SERVER_NAME}-${SERVER_PUBLIC_IP}"
+  echo "#==============================================================================="
+  echo "[Interface]"
+  echo "PrivateKey = $(cat "${OUT_DIR}/router_privatekey")"
+  echo "Address = ${ROUTER_ADDR}"
+  echo "DNS = ${DNS_LIST}"
+  if [[ -n "${WG_CLIENT_MTU:-}" ]]; then
+    echo "MTU = ${WG_CLIENT_MTU}"
+  fi
+  echo ""
+  echo "[Peer]"
+  echo "PublicKey = $(cat "$WG_PUB")"
+  echo "PresharedKey = $(cat "${OUT_DIR}/router_psk")"
+  echo "Endpoint = ${SERVER_PUBLIC_IP}:${WG_LISTENPORT}"
+  echo "AllowedIPs = ${ROUTER_ALLOWED_IPS_VAL}"
+  echo "PersistentKeepalive = ${KEEPALIVE}"
+} >"$ROUTER_CONF"
+
+chmod 600 "$ROUTER_CONF"
+
+PC_CONF="${OUT_DIR}/pc.conf"
+{
+  echo "#==============================================================================="
+  echo "# PC(ClientA).conf PEER to ${SERVER_NAME}-${SERVER_PUBLIC_IP}"
+  echo "#==============================================================================="
+  echo "[Interface]"
+  echo "PrivateKey = $(cat "${OUT_DIR}/pc_privatekey")"
+  echo "Address = ${PC_ADDR}"
+  echo "DNS = ${DNS_LIST}"
+  if [[ -n "${WG_CLIENT_MTU:-}" ]]; then
+    echo "MTU = ${WG_CLIENT_MTU}"
+  fi
+  echo ""
+  echo "[Peer]"
+  echo "PublicKey = $(cat "$WG_PUB")"
+  echo "PresharedKey = $(cat "${OUT_DIR}/pc_psk")"
+  echo "Endpoint = ${SERVER_PUBLIC_IP}:${WG_LISTENPORT}"
+  echo "AllowedIPs = 0.0.0.0/0, ::/0"
+  echo "PersistentKeepalive = ${KEEPALIVE}"
+} >"$PC_CONF"
+
+chmod 600 "$PC_CONF"
 
 ########################################
 # APPLY (same as up_labno_02.sh)
