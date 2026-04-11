@@ -48,6 +48,19 @@ port_in_use() {
   ss -tuln 2>/dev/null | awk -v p="$p" '$5 ~ (":" p) "$" { found=1 } END { exit !found }'
 }
 
+# True if IPv4 is RFC1918, loopback, link-local, or CGNAT (not usable as client Endpoint from internet).
+ipv4_is_non_public() {
+  local ip="${1//[[:space:]]/}"
+  [[ -z "$ip" ]] && return 0
+  [[ "$ip" =~ ^10\. ]] && return 0
+  [[ "$ip" =~ ^127\. ]] && return 0
+  [[ "$ip" =~ ^169\.254\. ]] && return 0
+  [[ "$ip" =~ ^192\.168\. ]] && return 0
+  [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] && return 0
+  [[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]] && return 0
+  return 1
+}
+
 ########################################
 # INTERFACE
 ########################################
@@ -195,25 +208,39 @@ fi
 echo "SERVER_NAME detected: $SERVER_NAME"
 
 echo "Auto-detecting SERVER_PUBLIC_IP..."
-SERVER_PUBLIC_IP="$(ip route get 1.1.1.1 2>/dev/null \
+ROUTE_SRC_IP="$(ip route get 1.1.1.1 2>/dev/null \
   | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}')"
-if [[ -z "$SERVER_PUBLIC_IP" ]]; then
-  SERVER_PUBLIC_IP="$(curl -fsS --max-time 3 https://ifconfig.me 2>/dev/null || true)"
+ROUTE_SRC_IP="${ROUTE_SRC_IP//[[:space:]]/}"
+
+SERVER_PUBLIC_IP=""
+if [[ -n "$ROUTE_SRC_IP" ]] && ! ipv4_is_non_public "$ROUTE_SRC_IP"; then
+  SERVER_PUBLIC_IP="$ROUTE_SRC_IP"
+  echo "Using route source IP (looks publicly routable): $SERVER_PUBLIC_IP"
+else
+  if [[ -n "$ROUTE_SRC_IP" ]]; then
+    echo "Route source IP ($ROUTE_SRC_IP) is private/link-local — clients on the internet need your public IP; querying via HTTP..."
+  fi
+  for _url in https://ifconfig.me https://ipinfo.io/ip https://api.ipify.org; do
+    _cand="$(curl -4fsS --max-time 5 "$_url" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ -n "$_cand" ]] && valid_ip "$_cand" && ! ipv4_is_non_public "$_cand"; then
+      SERVER_PUBLIC_IP="$_cand"
+      break
+    fi
+  done
 fi
+
 if [[ -z "$SERVER_PUBLIC_IP" ]]; then
-  SERVER_PUBLIC_IP="$(curl -fsS --max-time 3 https://ipinfo.io/ip 2>/dev/null || true)"
+  read -r -p "Could not detect public IPv4. Enter SERVER_PUBLIC_IP (EIP or WAN IP for Endpoint): " SERVER_PUBLIC_IP
 fi
-if [[ -z "$SERVER_PUBLIC_IP" ]]; then
-  SERVER_PUBLIC_IP="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
-fi
-if [[ -z "$SERVER_PUBLIC_IP" ]]; then
-  read -r -p "Could not detect public IP. Enter SERVER_PUBLIC_IP: " SERVER_PUBLIC_IP
-fi
-if [[ -z "$SERVER_PUBLIC_IP" ]]; then
-  echo "ERROR: SERVER_PUBLIC_IP is required"
+SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP//[[:space:]]/}"
+if [[ -z "$SERVER_PUBLIC_IP" ]] || ! valid_ip "$SERVER_PUBLIC_IP"; then
+  echo "ERROR: SERVER_PUBLIC_IP must be a valid IPv4"
   exit 1
 fi
-echo "SERVER_PUBLIC_IP detected: $SERVER_PUBLIC_IP"
+if ipv4_is_non_public "$SERVER_PUBLIC_IP"; then
+  echo "WARNING: SERVER_PUBLIC_IP ($SERVER_PUBLIC_IP) still looks private. Remote peers will not handshake unless they are on the same LAN/VPC."
+fi
+echo "SERVER_PUBLIC_IP for client Endpoint: $SERVER_PUBLIC_IP"
 
 ########################################
 # Optional DNS for client configs (router.sh / pc.sh defaults)
