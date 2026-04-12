@@ -350,7 +350,6 @@ gen_psk "${OUT_DIR}/pc_psk"
 KEEPALIVE="${KEEPALIVE:-25}"
 WG_USE_MARK_ROUTING="${WG_USE_MARK_ROUTING:-1}"
 WG_RP_FILTER="${WG_RP_FILTER:-0}"
-WG_POLICY_TABLE="${WG_POLICY_TABLE:-51820}"
 WG_TABLE="${WG_TABLE:-}"
 
 ROUTER_ADDR_EFFECTIVE="${ROUTER_ADDR}"
@@ -360,7 +359,7 @@ SERVER_IP_CIDR="${WG_SERVER_ADDR}"
 SERVER_IP="${SERVER_IP_CIDR%/*}"
 SUBNET="${SERVER_IP%.*}.0/24"
 
-POLICY_TABLE="${WG_POLICY_TABLE}"
+
 
 if [[ "${WG_USE_MARK_ROUTING}" == "1" ]]; then
   TABLE_VAL="off"
@@ -369,6 +368,18 @@ else
 fi
 
 WG_CONF="${WG_DIR}/${WG_IF}.conf"
+
+WG_NO="$(echo "$WG_IF" | sed -E 's/^wg([0-9]+)$/\1/')"
+
+if [[ ! "$WG_NO" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: cannot extract wg number from interface '$WG_IF'"
+  exit 1
+fi
+
+WG_FWMARK="$WG_NO"
+WG_POLICY_TABLE="$((WG_LISTENPORT + 1))"
+WG_RULE_PRIORITY="$((WG_NO + 1))"
+POLICY_TABLE="${WG_POLICY_TABLE}"
 
 {
   echo "[Interface]"
@@ -402,15 +413,15 @@ WG_CONF="${WG_DIR}/${WG_IF}.conf"
     echo ""
     echo "# ========= MARK PC TRAFFIC ========="
     echo "PostUp   = iptables -t mangle -A PREROUTING -i ${WG_IF} -s ${PC_IP_ONLY} -d ${SUBNET} -j ACCEPT"
-    echo "PostUp   = iptables -t mangle -A PREROUTING -i ${WG_IF} -s ${PC_IP_ONLY} -j MARK --set-mark 11"
+    echo "PostUp   = iptables -t mangle -A PREROUTING -i ${WG_IF} -s ${PC_IP_ONLY} -j MARK --set-mark ${WG_FWMARK}"
     echo "PostDown = iptables -t mangle -D PREROUTING -i ${WG_IF} -s ${PC_IP_ONLY} -d ${SUBNET} -j ACCEPT 2>/dev/null || true"
-    echo "PostDown = iptables -t mangle -D PREROUTING -i ${WG_IF} -s ${PC_IP_ONLY} -j MARK --set-mark 11 2>/dev/null || true"
+    echo "PostDown = iptables -t mangle -D PREROUTING -i ${WG_IF} -s ${PC_IP_ONLY} -j MARK --set-mark ${WG_FWMARK} 2>/dev/null || true"
 
     echo ""
     echo "# ========= POLICY ROUTING: PC -> Router ========="
-    echo "PostUp   = ip rule del fwmark 11 lookup ${POLICY_TABLE} priority 100 2>/dev/null || true"
-    echo "PostUp   = ip rule add fwmark 11 lookup ${POLICY_TABLE} priority 100"
-    echo "PostDown = ip rule del fwmark 11 lookup ${POLICY_TABLE} priority 100 2>/dev/null || true"
+    echo "PostUp   = ip rule del fwmark ${WG_FWMARK} lookup ${POLICY_TABLE} priority ${WG_RULE_PRIORITY} 2>/dev/null || true"
+    echo "PostUp   = ip rule add fwmark ${WG_FWMARK} lookup ${POLICY_TABLE} priority ${WG_RULE_PRIORITY}"
+    echo "PostDown = ip rule del fwmark ${WG_FWMARK} lookup ${POLICY_TABLE} priority ${WG_RULE_PRIORITY} 2>/dev/null || true"
 
     echo ""
     echo "PostUp   = ip route add ${SUBNET} dev ${WG_IF} table ${POLICY_TABLE} 2>/dev/null || ip route replace ${SUBNET} dev ${WG_IF} table ${POLICY_TABLE}"
@@ -427,11 +438,11 @@ WG_CONF="${WG_DIR}/${WG_IF}.conf"
     echo "PostUp = iptables -A FORWARD -i ${WG_IF} -o ${WG_IF} -j ACCEPT"
     echo "PostUp = iptables -I FORWARD -i ${WAN_IF} -o ${WG_IF} -j ACCEPT"
     echo "PostUp = iptables -t nat -A POSTROUTING -o ${WAN_IF} -j MASQUERADE"
-    echo "PostUp = ip rule del from ${PC_IP_ONLY} lookup ${TABLE_VAL} priority 100 2>/dev/null || true"
-    echo "PostUp = ip rule add from ${PC_IP_ONLY} lookup ${TABLE_VAL} priority 100"
+    echo "PostUp = ip rule del from ${PC_IP_ONLY} lookup ${TABLE_VAL} priority ${WG_RULE_PRIORITY} 2>/dev/null || true"
+    echo "PostUp = ip rule add from ${PC_IP_ONLY} lookup ${TABLE_VAL} priority ${WG_RULE_PRIORITY}"
     echo ""
     echo "PostDown = iptables -D FORWARD -i ${WG_IF} -o ${WG_IF} -j ACCEPT"
-    echo "PostDown = ip rule del from ${PC_IP_ONLY} lookup ${TABLE_VAL} priority 100"
+    echo "PostDown = ip rule del from ${PC_IP_ONLY} lookup ${TABLE_VAL} priority ${WG_RULE_PRIORITY}"
     echo "PostDown = iptables -D FORWARD -i ${WAN_IF} -o ${WG_IF} -j ACCEPT"
     echo "PostDown = iptables -t nat -D POSTROUTING -o ${WAN_IF} -j MASQUERADE"
   fi
@@ -470,7 +481,7 @@ MTU = ${MTU_VAL}
 PublicKey = $(cat "$WG_PUB")
 PresharedKey = $(cat "${OUT_DIR}/router_psk")
 Endpoint = ${SERVER_PUBLIC_IP}:${WG_LISTENPORT}
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = ${WG_NET}/24
 PersistentKeepalive = ${KEEPALIVE}
 EOF
 
@@ -535,6 +546,9 @@ echo "Done."
 echo "Server config : ${WG_CONF}"
 echo "Router config : ${ROUTER_CONF}"
 echo "PC config     : ${PC_CONF}"
+echo "FWMARK    : $WG_FWMARK"
+echo "POLICY_TB : $WG_POLICY_TABLE"
+echo "PRIORITY  : $WG_RULE_PRIORITY"
 echo
 echo "IMPORTANT:"
 echo "1) Make sure cloud firewall/security group allows UDP ${WG_LISTENPORT}"
