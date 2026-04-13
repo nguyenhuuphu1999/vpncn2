@@ -6,21 +6,6 @@ echo "======================================"
 echo " VPNCN2 WireGuard Setup (standalone)"
 echo "======================================"
 
-#DEFAULT_IF="wg98"
-#DEFAULT_WG_IP="10.100.6.254/24"
-# subnet theo wg number
-#WG_NO="$(echo "$WG_IF" | sed -E 's/^wg([0-9]+)$/\1/')"
-#WG_PREFIX="10.${WG_NO}.1"
-#WG_NET="${WG_PREFIX}.0"
-#WG_SERVER_IP="${WG_PREFIX}.254"
-#DEFAULT_WG_IP="${WG_SERVER_IP}/24"
-
-#DEFAULT_ROUTER_IP="10.100.6.1"
-#DEFAULT_PC_IP="10.100.6.253"
-#DEFAULT_ROUTER_IP="${WG_PREFIX}.1"
-#DEFAULT_PC_IP="${WG_PREFIX}.253"
-
-
 DEFAULT_PORT=""
 DEFAULT_ROUTER_NAME="config"
 DEFAULT_MTU="1420"
@@ -308,7 +293,7 @@ if [[ "${OVERRIDE,,}" == "y" ]]; then
 
     break
   done
-  ROUTER_ADDR="${ROUTER_IP}/32"
+  ROUTER_ADDR="${ROUTER_IP}/24"
 
   # ===== PC =====
   while true; do
@@ -324,7 +309,7 @@ if [[ "${OVERRIDE,,}" == "y" ]]; then
     break
   done
 
-  PC_ADDR="${PC_IP}/32"
+  PC_ADDR="${PC_IP}/24"
   PC_IP_ONLY="$PC_IP"
 
 else
@@ -333,28 +318,13 @@ else
   WG_SERVER_IP="${WG_SERVER_ADDR%/24}"
 
   ROUTER_IP="$DEFAULT_ROUTER_IP"
-  ROUTER_ADDR="${ROUTER_IP}/32"
+  ROUTER_ADDR="${ROUTER_IP}/24"
 
   PC_IP="$DEFAULT_PC_IP"
-  PC_ADDR="${PC_IP}/32"
+  PC_ADDR="${PC_IP}/24"
   PC_IP_ONLY="$PC_IP"
 
 fi
-
-# ========= AUTO RANDOM PORT (51820-51900, avoid conflict) =========
-generate_random_port() {
-  while true; do
-    local p
-    p=$(shuf -i 51820-51900 -n 1)
-    if ! port_in_use "$p"; then
-      echo "$p"
-      return 0
-    fi
-  done
-}
-
-WG_LISTENPORT="$(generate_random_port)"
-echo "Auto-selected WG port: $WG_LISTENPORT"
 
 
 WAN_IF_AUTO="$(detect_wan_if)"
