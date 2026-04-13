@@ -6,12 +6,23 @@ echo "======================================"
 echo " VPNCN2 WireGuard Setup (standalone)"
 echo "======================================"
 
-DEFAULT_IF="wg98"
-DEFAULT_WG_IP="10.100.6.254/24"
-DEFAULT_ROUTER_IP="10.100.6.1"
-DEFAULT_PC_IP="10.100.6.253"
-DEFAULT_PORT="51830"
-DEFAULT_ROUTER_NAME="fomi"
+#DEFAULT_IF="wg98"
+#DEFAULT_WG_IP="10.100.6.254/24"
+# subnet theo wg number
+#WG_NO="$(echo "$WG_IF" | sed -E 's/^wg([0-9]+)$/\1/')"
+#WG_PREFIX="10.${WG_NO}.1"
+#WG_NET="${WG_PREFIX}.0"
+#WG_SERVER_IP="${WG_PREFIX}.254"
+#DEFAULT_WG_IP="${WG_SERVER_IP}/24"
+
+#DEFAULT_ROUTER_IP="10.100.6.1"
+#DEFAULT_PC_IP="10.100.6.253"
+#DEFAULT_ROUTER_IP="${WG_PREFIX}.1"
+#DEFAULT_PC_IP="${WG_PREFIX}.253"
+
+
+DEFAULT_PORT=""
+DEFAULT_ROUTER_NAME="config"
 DEFAULT_MTU="1420"
 WG_DIR="${WG_DIR:-/etc/wireguard}"
 
@@ -138,8 +149,118 @@ detect_public_ip() {
 }
 
 while true; do
-  read -r -p "WireGuard interface [$DEFAULT_IF]: " WG_IF
-  WG_IF=${WG_IF:-$DEFAULT_IF}
+  # ========= AUTO RANDOM WG INTERFACE =========
+  generate_wg_if() {
+    while true; do
+      local n
+      n=$(shuf -i 50-100 -n 1)
+      if ! ip link show "wg$n" >/dev/null 2>&1; then
+        echo "wg$n"
+        return
+      fi
+    done
+  }
+
+  WG_IF="$(generate_wg_if)"
+  echo "Auto-selected interface: $WG_IF"
+
+  # ========= DERIVE SUBNET FROM WG_IF =========
+  WG_NO="$(echo "$WG_IF" | sed -E 's/^wg([0-9]+)$/\1/')"
+
+  if [[ ! "$WG_NO" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: cannot extract wg number from $WG_IF"
+    exit 1
+  fi
+
+  WG_PREFIX="10.${WG_NO}.1"
+  WG_NET="${WG_PREFIX}.0"
+
+  DEFAULT_WG_IP="${WG_PREFIX}.254/24"
+  DEFAULT_ROUTER_IP="${WG_PREFIX}.1"
+  DEFAULT_PC_IP="${WG_PREFIX}.253"
+
+  echo "Auto subnet: ${WG_NET}/24"
+  echo "Server IP : ${DEFAULT_WG_IP}"
+  echo "Router IP : ${DEFAULT_ROUTER_IP}"
+  echo "PC IP     : ${DEFAULT_PC_IP}"
+
+  # ========= AUTO PORT =========
+  generate_random_port() {
+    while true; do
+      local p
+      p=$(shuf -i 51820-51900 -n 1)
+      if ! port_in_use "$p"; then
+        echo "$p"
+        return 0
+      fi
+    done
+  }
+
+  WG_LISTENPORT="$(generate_random_port)"
+  DNS_LIST="8.8.8.8,8.8.4.4"
+
+  echo "Auto-selected WG port: $WG_LISTENPORT"
+  echo "Auto DNS           : $DNS_LIST"
+
+  read -r -p "Do you want to keep this config ? Default(Y) [Y/n]: " OVERRIDE
+  OVERRIDE=${OVERRIDE:-n}
+
+  if [[ "${OVERRIDE,,}" == "y" ]]; then
+
+    # ===== OVERRIDE WG NUMBER =====
+    while true; do
+      read -r -p "Enter WG number (50-100) [$WG_NO]: " NEW_WG_NO
+      NEW_WG_NO=${NEW_WG_NO:-$WG_NO}
+
+      if ! [[ "$NEW_WG_NO" =~ ^[0-9]+$ ]] || ((NEW_WG_NO < 50 || NEW_WG_NO > 100)); then
+        echo "ERROR: must be 50-100"
+        continue
+      fi
+
+      if ip link show "wg${NEW_WG_NO}" >/dev/null 2>&1; then
+        echo "ERROR: wg${NEW_WG_NO} exists"
+        continue
+      fi
+
+      WG_NO="$NEW_WG_NO"
+      WG_IF="wg${WG_NO}"
+
+      WG_PREFIX="10.${WG_NO}.1"
+      WG_NET="${WG_PREFIX}.0"
+
+      DEFAULT_WG_IP="${WG_PREFIX}.254/24"
+      DEFAULT_ROUTER_IP="${WG_PREFIX}.1"
+      DEFAULT_PC_IP="${WG_PREFIX}.253"
+
+      break
+    done
+
+    # ===== OVERRIDE PORT =====
+    while true; do
+      read -r -p "WG ListenPort [$WG_LISTENPORT]: " NEW_PORT
+      NEW_PORT=${NEW_PORT:-$WG_LISTENPORT}
+
+      if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || ((NEW_PORT < 1 || NEW_PORT > 65535)); then
+        echo "ERROR: invalid port"
+        continue
+      fi
+
+      if port_in_use "$NEW_PORT"; then
+        echo "ERROR: port already in use"
+        continue
+      fi
+
+      WG_LISTENPORT="$NEW_PORT"
+      break
+    done
+
+    # ===== OVERRIDE DNS =====
+    read -r -p "DNS [$DNS_LIST]: " NEW_DNS
+    DNS_LIST="${NEW_DNS:-$DNS_LIST}"
+
+  fi
+
+
   if [[ ! $WG_IF =~ ^wg ]]; then
     echo "ERROR: interface must start with wg"
     continue
@@ -147,100 +268,94 @@ while true; do
   break
 done
 
-while true; do
-  read -r -p "Output folder name under ${WG_DIR} [$DEFAULT_ROUTER_NAME]: " ROUTER_NAME
-  ROUTER_NAME=${ROUTER_NAME:-$DEFAULT_ROUTER_NAME}
-  if [[ -z "$ROUTER_NAME" || "$ROUTER_NAME" == *"/"* ]]; then
-    echo "ERROR: invalid folder name"
-    continue
-  fi
-  break
-done
+#block-here
+ROUTER_NAME="${DEFAULT_ROUTER_NAME}"
+OUT_DIR="${WG_DIR}/${ROUTER_NAME}"
 
 OUT_DIR="${WG_DIR}/${ROUTER_NAME}"
 
-while true; do
-  read -r -p "WG server Address (CIDR, /24 only) [$DEFAULT_WG_IP]: " WG_IP_LAN
-  WG_IP_LAN=${WG_IP_LAN:-$DEFAULT_WG_IP}
-  if ! [[ $WG_IP_LAN =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/24$ ]]; then
-    echo "ERROR: must be IPv4 /24 (example 10.100.6.254/24)"
-    continue
-  fi
+if [[ "${OVERRIDE,,}" == "y" ]]; then
 
-  WG_SERVER_IP="${WG_IP_LAN%/24}"
-  valid_ip "$WG_SERVER_IP" || { echo "ERROR: invalid IP"; continue; }
-  WG_PREFIX="$(echo "$WG_SERVER_IP" | cut -d. -f1-3)"
-  WG_NET="${WG_PREFIX}.0"
-
-  CONFLICT=false
-  for conf in /etc/wireguard/*.conf; do
-    [[ -e "$conf" ]] || continue
-    [[ "$(basename "$conf")" == "${WG_IF}.conf" ]] && continue
-
-    EXIST_LINE="$(grep -E '^[[:space:]]*Address[[:space:]]*=' "$conf" | head -n1 || true)"
-    [[ -z "$EXIST_LINE" ]] && continue
-
-    EXIST_IP="$(echo "$EXIST_LINE" | awk -F= '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2}' | cut -d/ -f1)"
-    [[ -z "$EXIST_IP" ]] && continue
-
-    EXIST_PREFIX="$(echo "$EXIST_IP" | cut -d. -f1-3)"
-    if [[ "$EXIST_PREFIX" == "$WG_PREFIX" ]]; then
-      echo "ERROR: WG subnet conflict with $conf"
-      CONFLICT=true
+  # ===== SERVER =====
+  while true; do
+    read -r -p "WG server Address (CIDR, /24 only) [$DEFAULT_WG_IP]: " WG_IP_LAN
+    WG_IP_LAN=${WG_IP_LAN:-$DEFAULT_WG_IP}
+    if ! [[ $WG_IP_LAN =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/24$ ]]; then
+      echo "ERROR: must be IPv4 /24"
+      continue
     fi
+
+    WG_SERVER_IP="${WG_IP_LAN%/24}"
+    valid_ip "$WG_SERVER_IP" || { echo "ERROR: invalid IP"; continue; }
+
+    WG_PREFIX="$(echo "$WG_SERVER_IP" | cut -d. -f1-3)"
+    WG_NET="${WG_PREFIX}.0"
+    break
   done
 
-  [[ "$CONFLICT" == true ]] && continue
-  break
-done
+  WG_SERVER_ADDR="$WG_IP_LAN"
 
-WG_SERVER_ADDR="$WG_IP_LAN"
+  # ===== ROUTER =====
+  while true; do
+    read -r -p "Router WG IP (host, same /24) [$DEFAULT_ROUTER_IP]: " ROUTER_IP
+    ROUTER_IP=${ROUTER_IP:-$DEFAULT_ROUTER_IP}
+    valid_ip "$ROUTER_IP" || { echo "ERROR: invalid IPv4"; continue; }
 
-while true; do
-  read -r -p "Router WG IP (host, same /24) [$DEFAULT_ROUTER_IP]: " ROUTER_IP
-  ROUTER_IP=${ROUTER_IP:-$DEFAULT_ROUTER_IP}
-  valid_ip "$ROUTER_IP" || { echo "ERROR: invalid IPv4"; continue; }
-  ROUTER_PREFIX="$(echo "$ROUTER_IP" | cut -d. -f1-3)"
-  if [[ "$ROUTER_PREFIX" != "$WG_PREFIX" ]]; then
-    echo "ERROR: Router IP must be inside ${WG_PREFIX}.0/24"
-    continue
-  fi
-  if [[ "$ROUTER_IP" == "$WG_SERVER_IP" ]]; then
-    echo "ERROR: Router IP cannot equal Server IP"
-    continue
-  fi
-  break
-done
-ROUTER_ADDR="${ROUTER_IP}/24"
+    ROUTER_PREFIX="$(echo "$ROUTER_IP" | cut -d. -f1-3)"
+    [[ "$ROUTER_PREFIX" != "$WG_PREFIX" ]] && { echo "ERROR: must be same subnet"; continue; }
 
-while true; do
-  read -r -p "PC WG IP (host, same /24) [$DEFAULT_PC_IP]: " PC_IP
-  PC_IP=${PC_IP:-$DEFAULT_PC_IP}
-  valid_ip "$PC_IP" || { echo "ERROR: invalid IPv4"; continue; }
-  PC_PREFIX="$(echo "$PC_IP" | cut -d. -f1-3)"
-  if [[ "$PC_PREFIX" != "$WG_PREFIX" ]]; then
-    echo "ERROR: PC IP must be inside ${WG_PREFIX}.0/24"
-    continue
-  fi
-  if [[ "$PC_IP" == "$ROUTER_IP" || "$PC_IP" == "$WG_SERVER_IP" ]]; then
-    echo "ERROR: PC IP cannot equal Router IP or Server IP"
-    continue
-  fi
-  break
-done
-PC_ADDR="${PC_IP}/24"
-PC_IP_ONLY="$PC_IP"
+    [[ "$ROUTER_IP" == "$WG_SERVER_IP" ]] && { echo "ERROR: conflict"; continue; }
 
-while true; do
-  read -r -p "WG Listen Port [$DEFAULT_PORT]: " WG_PORT
-  WG_PORT=${WG_PORT:-$DEFAULT_PORT}
-  if ! [[ "$WG_PORT" =~ ^[0-9]+$ ]] || ((WG_PORT < 1 || WG_PORT > 65535)); then
-    echo "ERROR: port must be 1-65535"
-    continue
-  fi
-  break
-done
-WG_LISTENPORT="$WG_PORT"
+    break
+  done
+  ROUTER_ADDR="${ROUTER_IP}/32"
+
+  # ===== PC =====
+  while true; do
+    read -r -p "PC WG IP (host, same /24) [$DEFAULT_PC_IP]: " PC_IP
+    PC_IP=${PC_IP:-$DEFAULT_PC_IP}
+    valid_ip "$PC_IP" || { echo "ERROR: invalid IPv4"; continue; }
+
+    PC_PREFIX="$(echo "$PC_IP" | cut -d. -f1-3)"
+    [[ "$PC_PREFIX" != "$WG_PREFIX" ]] && { echo "ERROR: must be same subnet"; continue; }
+
+    [[ "$PC_IP" == "$ROUTER_IP" || "$PC_IP" == "$WG_SERVER_IP" ]] && { echo "ERROR: conflict"; continue; }
+
+    break
+  done
+
+  PC_ADDR="${PC_IP}/32"
+  PC_IP_ONLY="$PC_IP"
+
+else
+  # ===== AUTO MODE (NO INPUT AT ALL) =====
+  WG_SERVER_ADDR="$DEFAULT_WG_IP"
+  WG_SERVER_IP="${WG_SERVER_ADDR%/24}"
+
+  ROUTER_IP="$DEFAULT_ROUTER_IP"
+  ROUTER_ADDR="${ROUTER_IP}/32"
+
+  PC_IP="$DEFAULT_PC_IP"
+  PC_ADDR="${PC_IP}/32"
+  PC_IP_ONLY="$PC_IP"
+
+fi
+
+# ========= AUTO RANDOM PORT (51820-51900, avoid conflict) =========
+generate_random_port() {
+  while true; do
+    local p
+    p=$(shuf -i 51820-51900 -n 1)
+    if ! port_in_use "$p"; then
+      echo "$p"
+      return 0
+    fi
+  done
+}
+
+WG_LISTENPORT="$(generate_random_port)"
+echo "Auto-selected WG port: $WG_LISTENPORT"
+
 
 WAN_IF_AUTO="$(detect_wan_if)"
 if [[ -z "$WAN_IF_AUTO" ]]; then
@@ -277,7 +392,7 @@ if [[ -z "${SERVER_NAME:-}" ]]; then
 fi
 
 if [[ -z "${SERVER_PUBLIC_IP:-}" ]]; then
-  echo "Auto-detecting SERVER_PUBLIC_IP..."
+  echo "Auto-detecting SERVER_PUBLIC_IP...(Please wait for 03 seconds)"
   if ! SERVER_PUBLIC_IP="$(detect_public_ip)"; then
     echo "ERROR: Cannot auto-detect public IP from cloud metadata or external services"
     exit 1
@@ -292,10 +407,7 @@ valid_ip "$SERVER_PUBLIC_IP" || {
 echo "SERVER_NAME detected: $SERVER_NAME"
 echo "SERVER_PUBLIC_IP detected: $SERVER_PUBLIC_IP"
 
-if [[ -z "${DNS_LIST:-}" ]]; then
-  read -r -p "Client DNS list [8.8.8.8, 8.8.4.4]: " DNS_LIST
-  DNS_LIST="${DNS_LIST:-8.8.8.8, 8.8.4.4}"
-fi
+DNS_LIST="8.8.8.8,8.8.4.4"
 
 echo
 echo "Interface : $WG_IF"
@@ -310,8 +422,15 @@ echo "MTU       : $MTU_VAL"
 echo "OUT_DIR   : $OUT_DIR"
 echo
 
-read -r -p "Proceed? [y/N]: " CONFIRM
-if [[ ! "${CONFIRM,,}" =~ ^y(es)?$ ]]; then
+read -r -p "Proceed? Y-Proceed(default) N-Abort [Y/n]: " CONFIRM
+
+# normalize input
+CONFIRM="$(echo "$CONFIRM" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+
+# default = y nếu rỗng
+CONFIRM="${CONFIRM:-y}"
+
+if [[ "$CONFIRM" == "n" ]]; then
   echo "Aborted."
   exit 0
 fi
@@ -452,11 +571,11 @@ POLICY_TABLE="${WG_POLICY_TABLE}"
   echo "[Peer]"
   echo "PublicKey = $(cat "${OUT_DIR}/router_publickey")"
   echo "PresharedKey = $(cat "${OUT_DIR}/router_psk")"
-  echo "AllowedIPs = 0.0.0.0/0"
+  echo "AllowedIPs = ${ROUTER_IP_32}/32,0.0.0.0/0"
   echo "PersistentKeepalive = ${KEEPALIVE}"
 
   echo ""
-  echo "# ------ PC ------"
+  echo "# ------ PC.conf - WG Client for PC which wana connect to Router ------"
   echo "[Peer]"
   echo "PublicKey = $(cat "${OUT_DIR}/pc_publickey")"
   echo "PresharedKey = $(cat "${OUT_DIR}/pc_psk")"
@@ -469,7 +588,8 @@ chmod 600 "$WG_CONF"
 ROUTER_CONF="${OUT_DIR}/router.conf"
 cat > "$ROUTER_CONF" <<EOF
 #===============================================================================
-# ${ROUTER_NAME}.conf PEER to ${SERVER_NAME}-${SERVER_PUBLIC_IP}
+# ROUTER.conf PEER to ${SERVER_NAME}-${SERVER_PUBLIC_IP}
+# COPY AND PASTE THESE CONFIG TO PUSH INTO ROUTER through CONNECT-ROUTER - EXTERNAL FUNCTION
 #===============================================================================
 [Interface]
 PrivateKey = $(cat "${OUT_DIR}/router_privatekey")
@@ -550,8 +670,14 @@ echo "FWMARK    : $WG_FWMARK"
 echo "POLICY_TB : $WG_POLICY_TABLE"
 echo "PRIORITY  : $WG_RULE_PRIORITY"
 echo
+printf "\n===== ROUTER CONFIG =====\n\n"
+cat "$ROUTER_CONF"
+
+printf "\n===== PC CONFIG =====\n\n"
+cat "$PC_CONF"
+echo
 echo "IMPORTANT:"
-echo "1) Make sure cloud firewall/security group allows UDP ${WG_LISTENPORT}"
-echo "2) Import/apply router.conf on router"
-echo "3) Import/apply pc.conf on PC"
-echo "4) Check handshake on server with: wg show"
+echo "1) Make sure Your WG-SERVER firewall/security group allows UDP ${WG_LISTENPORT}"
+echo "2) Import/apply router.conf into VPNCN2 ROUTER through UI"
+echo "3) Import/apply pc.conf on PC which wana connect to ROUTER"
+echo "4) Check handshake on server by: wg show"
